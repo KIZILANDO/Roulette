@@ -769,29 +769,59 @@ function tryPlayVideo(url, wrapper) {
     video.controls = true;
     video.autoplay = true;
     video.playsInline = true;
+    video.muted = true;
+    video.setAttribute('webkit-playsinline', 'true');
+    video.setAttribute('playsinline', '');
+    video.preload = 'auto';
     video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
+
+    let resolved = false;
+    const done = (ok) => { if (!resolved) { resolved = true; clearTimeout(timeout); resolve(ok); } };
 
     const timeout = setTimeout(() => {
       console.log('[video] Timeout pour', url.substring(0, 60));
-      resolve(false);
+      // Si la vidéo a une durée, c'est qu'elle charge quand même
+      if (video.readyState >= 2) { done(true); return; }
+      wrapper.removeChild(video);
+      done(false);
     }, 15000);
 
-    video.onloadeddata = () => {
-      clearTimeout(timeout);
-      wrapper.innerHTML = '';
-      wrapper.appendChild(video);
+    const onReady = () => {
+      video.onloadeddata = null;
+      video.oncanplay = null;
       video.play().catch(() => {});
-      resolve(true);
+      // Ajouter bouton unmute
+      addUnmuteBtn(wrapper, video);
+      done(true);
     };
+
+    video.onloadeddata = onReady;
+    video.oncanplay = onReady;
 
     video.onerror = () => {
-      clearTimeout(timeout);
       console.log('[video] Erreur pour', url.substring(0, 60));
-      resolve(false);
+      wrapper.removeChild(video);
+      done(false);
     };
 
+    // Attacher au DOM AVANT de set src (nécessaire sur mobile)
+    wrapper.innerHTML = '';
+    wrapper.appendChild(video);
     video.src = url;
+    video.load();
   });
+}
+
+function addUnmuteBtn(wrapper, video) {
+  if (!video.muted) return;
+  const btn = document.createElement('button');
+  btn.textContent = '🔇 Appuie pour le son';
+  btn.style.cssText = 'position:absolute;bottom:16px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.7);color:#fff;border:2px solid #25f4ee;border-radius:30px;padding:10px 22px;font-size:.9rem;font-weight:600;cursor:pointer;z-index:10;backdrop-filter:blur(4px)';
+  wrapper.style.position = 'relative';
+  wrapper.appendChild(btn);
+  btn.onclick = () => { video.muted = false; btn.remove(); };
+  // Auto-remove après 8s si pas cliqué
+  setTimeout(() => { if (btn.parentNode) btn.remove(); }, 8000);
 }
 
 // --- Socket events ---
@@ -857,6 +887,7 @@ socket.on('new_round', data => {
 
   // Video — 3 méthodes en cascade
   const wrapper = document.getElementById('videoWrapper');
+  wrapper.style.position = 'relative';
   wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vidéo...</div>';
   loadVideo(data.direct_url, data.tiktok_url, data.video_id, wrapper);
 
