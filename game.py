@@ -136,51 +136,73 @@ def test_extract():
     return "ECHEC — tikwm n'a pas pu extraire la vidéo", 500
 
 
-@app.route("/stream/<video_id>")
-def stream_video(video_id):
-    """Sert la vidéo pré-téléchargée depuis le cache mémoire."""
-    # Servir depuis le cache bytes (pré-téléchargé au début du round)
+def _ensure_bytes_cached(video_id):
+    """S'assure que les bytes de la vidéo sont en cache. Retourne le cache entry ou None."""
     with bytes_cache_lock:
         cached = video_bytes_cache.get(video_id)
     if cached:
-        return Response(
-            cached["bytes"],
-            content_type=cached["content_type"],
-            headers={
-                "Accept-Ranges": "bytes",
-                "Cache-Control": "public, max-age=3600",
-            },
-        )
+        return cached
 
-    # Fallback : proxy streaming si pas dans le cache bytes
+    # Pas en cache bytes, essayer de télécharger depuis video_cache (URL info)
     with cache_lock:
         info = video_cache.get(video_id)
     if not info:
+        return None
+
+    dl_headers = {k: v for k, v in info["headers"].items()
+                  if k.lower() in ("user-agent", "referer", "cookie", "accept")}
+    try:
+        resp = http_requests.get(info["url"], headers=dl_headers, timeout=30)
+        resp.raise_for_status()
+        ct = resp.headers.get("Content-Type", "video/mp4")
+        entry = {"bytes": resp.content, "content_type": ct}
+        with bytes_cache_lock:
+            video_bytes_cache[video_id] = entry
+        return entry
+    except Exception as e:
+        print(f"  [stream] Erreur téléchargement: {e}")
+        return None
+
+
+@app.route("/stream/<video_id>")
+def stream_video(video_id):
+    """Sert la vidéo depuis le cache avec support des Range requests (HTTP 206)."""
+    cached = _ensure_bytes_cached(video_id)
+    if not cached:
         return "Vidéo non trouvée", 404
 
-    headers = {}
-    for k, v in info["headers"].items():
-        if k.lower() in ("user-agent", "referer", "cookie", "accept"):
-            headers[k] = v
+    data = cached["bytes"]
+    content_type = cached["content_type"]
+    total = len(data)
 
-    try:
-        resp = http_requests.get(info["url"], headers=headers, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  [stream] Erreur proxy: {e}")
-        return f"Erreur proxy: {e}", 502
-
-    content_type = resp.headers.get("Content-Type", "video/mp4")
-
-    # Cacher les bytes pour les prochaines requêtes
-    with bytes_cache_lock:
-        video_bytes_cache[video_id] = {"bytes": resp.content, "content_type": content_type}
+    # Gérer les Range requests (indispensable pour <video> dans la plupart des navigateurs)
+    range_header = request.headers.get("Range")
+    if range_header:
+        # Parse "bytes=start-end"
+        m = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total - 1
+            end = min(end, total - 1)
+            chunk = data[start:end + 1]
+            return Response(
+                chunk,
+                status=206,
+                content_type=content_type,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{total}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(chunk)),
+                    "Cache-Control": "public, max-age=3600",
+                },
+            )
 
     return Response(
-        resp.content,
+        data,
         content_type=content_type,
         headers={
             "Accept-Ranges": "bytes",
+            "Content-Length": str(total),
             "Cache-Control": "public, max-age=3600",
         },
     )
@@ -188,14 +210,20 @@ def stream_video(video_id):
 
 @app.route("/api/extract")
 def api_extract():
-    """Proxy pour l'API tikwm — utilisé en fallback par le client."""
+    """Extrait et pré-télécharge la vidéo pour la servir via /stream/."""
     url = request.args.get("url", "")
+    video_id = request.args.get("video_id", "")
     if not url:
         return {"error": "URL manquante"}, 400
     info = extract_video_info(url)
-    if info:
-        return {"video_url": info["url"]}
-    return {"error": "Extraction échouée"}, 500
+    if not info:
+        return {"error": "Extraction échouée"}, 500
+    # Mettre en cache pour que /stream/ puisse servir
+    if video_id:
+        with cache_lock:
+            video_cache[video_id] = info
+        _ensure_bytes_cached(video_id)
+    return {"video_url": info["url"]}
 
 
 # --- Socket.IO ---
@@ -748,15 +776,13 @@ function renderScoreboard(scores, containerId) {
 // --- Chargement vidéo : proxy serveur en priorité ---
 async function loadVideo(videoReady, tiktokUrl, videoId, wrapper) {
   // Méthode 1 : Proxy serveur (vidéo pré-téléchargée, fiable pour tous les joueurs)
-  if (videoReady) {
-    console.log('[video] Essai proxy serveur (pré-téléchargée)...');
-    if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
-  }
+  console.log('[video] Essai proxy serveur...');
+  if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
 
   // Méthode 2 : Proxy serveur via extraction à la demande
   console.log('[video] Essai extraction serveur...');
   try {
-    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl));
+    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl) + '&video_id=' + encodeURIComponent(videoId));
     const data = await r.json();
     if (data.video_url) {
       if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
@@ -795,24 +821,28 @@ function tryPlayVideo(url, wrapper) {
     video.controls = true;
     video.autoplay = true;
     video.playsInline = true;
+    video.muted = true;
     video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
 
     const timeout = setTimeout(() => {
       console.log('[video] Timeout pour', url.substring(0, 60));
+      video.src = '';
       resolve(false);
-    }, 15000);
+    }, 20000);
 
-    video.onloadeddata = () => {
+    video.oncanplay = () => {
       clearTimeout(timeout);
       wrapper.innerHTML = '';
       wrapper.appendChild(video);
-      video.play().catch(() => {});
+      video.muted = false;
+      video.play().catch(() => { video.muted = true; video.play().catch(() => {}); });
       resolve(true);
     };
 
     video.onerror = () => {
       clearTimeout(timeout);
       console.log('[video] Erreur pour', url.substring(0, 60));
+      video.src = '';
       resolve(false);
     };
 
