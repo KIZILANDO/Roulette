@@ -170,6 +170,18 @@ def stream_video(video_id):
     )
 
 
+@app.route("/api/extract")
+def api_extract():
+    """Proxy pour l'API tikwm — utilisé en fallback par le client."""
+    url = request.args.get("url", "")
+    if not url:
+        return {"error": "URL manquante"}, 400
+    info = extract_video_info(url)
+    if info:
+        return {"video_url": info["url"]}
+    return {"error": "Extraction échouée"}, 500
+
+
 # --- Socket.IO ---
 
 def room_player_list(room):
@@ -337,37 +349,22 @@ def start_round(room_code):
     room["current_video"] = video
     room["current_owner"] = owner["pseudo"]
 
-    # Extraire la vidéo via tikwm — retry jusqu'à 3 vidéos si échec
-    info = None
-    attempts = 0
-    while not info and attempts < 3:
-        print(f"  Extraction tentative {attempts+1} : {video['url']}")
-        info = extract_video_info(video["url"])
-        if not info:
-            attempts += 1
-            # Essayer une autre vidéo du même owner
-            other = [v for v in available if v["video_id"] != video["video_id"] and v["video_id"] not in room["used_videos"]]
-            if other:
-                video = random.choice(other)
-                room["used_videos"].add(video["video_id"])
-                room["current_video"] = video
-            else:
-                break
-
-    stream_url = None
+    # Extraire la vidéo via tikwm côté serveur
+    # On envoie l'URL directe au client (pas de proxy)
+    direct_url = None
+    info = extract_video_info(video["url"])
     if info and info["url"]:
-        with cache_lock:
-            video_cache[video["video_id"]] = info
-        stream_url = f"/stream/{video['video_id']}"
-        print(f"  ✓ Vidéo prête: /stream/{video['video_id']}")
+        direct_url = info["url"]
+        print(f"  ✓ URL directe extraite pour {video['video_id']}")
     else:
-        print(f"  ✗ Impossible d'extraire la vidéo après {attempts} tentatives")
+        print(f"  ✗ Extraction serveur échouée, le client fera l'extraction")
 
     round_data = {
         "round": room["current_round"],
         "total_rounds": room["num_rounds"],
-        "stream_url": stream_url,
+        "direct_url": direct_url,
         "tiktok_url": video["url"],
+        "video_id": video["video_id"],
         "author": video["author"],
         "players": [p["pseudo"] for p in room["players"].values()],
         "scores": room["scores"],
@@ -718,6 +715,84 @@ function renderScoreboard(scores, containerId) {
     ).join('');
 }
 
+// --- Chargement vidéo : 3 méthodes en cascade ---
+async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
+  // Méthode 1 : URL directe envoyée par le serveur
+  if (directUrl) {
+    console.log('[video] Essai URL directe...');
+    if (await tryPlayVideo(directUrl, wrapper)) return;
+  }
+
+  // Méthode 2 : Extraction côté client via tikwm (IP du joueur)
+  console.log('[video] Essai tikwm côté client...');
+  try {
+    const r = await fetch('https://www.tikwm.com/api/', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'url=' + encodeURIComponent(tiktokUrl) + '&hd=1',
+    });
+    const data = await r.json();
+    if (data.code === 0) {
+      let vurl = data.data.hdplay || data.data.play;
+      if (vurl) {
+        if (vurl.startsWith('/')) vurl = 'https://www.tikwm.com' + vurl;
+        console.log('[video] tikwm client OK');
+        if (await tryPlayVideo(vurl, wrapper)) return;
+      }
+    }
+  } catch(e) {
+    console.log('[video] tikwm client CORS/erreur:', e.message);
+  }
+
+  // Méthode 3 : Proxy serveur (API extract + stream)
+  console.log('[video] Essai via proxy serveur...');
+  try {
+    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl));
+    const data = await r.json();
+    if (data.video_url) {
+      // Essayer direct d'abord, puis proxy
+      if (await tryPlayVideo(data.video_url, wrapper)) return;
+      if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
+    }
+  } catch(e) {
+    console.log('[video] proxy erreur:', e.message);
+  }
+
+  wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
+}
+
+function tryPlayVideo(url, wrapper) {
+  return new Promise(resolve => {
+    const video = document.createElement('video');
+    video.controls = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous';
+    video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
+
+    const timeout = setTimeout(() => {
+      console.log('[video] Timeout pour', url.substring(0, 60));
+      resolve(false);
+    }, 8000);
+
+    video.onloadeddata = () => {
+      clearTimeout(timeout);
+      wrapper.innerHTML = '';
+      wrapper.appendChild(video);
+      video.play().catch(() => {});
+      resolve(true);
+    };
+
+    video.onerror = () => {
+      clearTimeout(timeout);
+      console.log('[video] Erreur pour', url.substring(0, 60));
+      resolve(false);
+    };
+
+    video.src = url;
+  });
+}
+
 // --- Socket events ---
 
 socket.on('room_created', data => {
@@ -779,13 +854,10 @@ socket.on('new_round', data => {
   const ownerAlert = document.getElementById('ownerAlert');
   ownerAlert.style.display = data.is_yours ? 'block' : 'none';
 
-  // Video
+  // Video — 3 méthodes en cascade
   const wrapper = document.getElementById('videoWrapper');
-  if (data.stream_url) {
-    wrapper.innerHTML = '<video controls autoplay playsinline><source src="' + data.stream_url + '" type="video/mp4"></video>';
-  } else {
-    wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo</div>';
-  }
+  wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vidéo...</div>';
+  loadVideo(data.direct_url, data.tiktok_url, data.video_id, wrapper);
 
   // Vote section
   const voteSection = document.getElementById('voteSection');
