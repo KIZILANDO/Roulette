@@ -3,3 +3,4 @@ flask-socketio
 requests
 gevent
 gevent-websocket
+gunicorn
