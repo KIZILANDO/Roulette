@@ -34,7 +34,38 @@ cache_lock = threading.Lock()
 
 
 def extract_video_info(tiktok_url):
-    """Extrait l'URL vidéo (pas audio) via tikwm."""
+    """Extrait l'URL vidéo (pas audio) via tikwm — POST + fallback GET."""
+    # Méthode 1 : tikwm POST (plus fiable que GET)
+    try:
+        r = http_requests.post(
+            "https://www.tikwm.com/api/",
+            data={"url": tiktok_url, "hd": "1"},
+            headers={
+                "User-Agent": UA,
+                "Referer": "https://www.tikwm.com/",
+                "Origin": "https://www.tikwm.com",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=15,
+        )
+        data = r.json()
+        if data.get("code") == 0:
+            d = data["data"]
+            # "play" = vidéo sans watermark, "hdplay" = HD
+            # NE PAS utiliser "music" / "music_info" qui est juste l'audio
+            video_url = d.get("hdplay") or d.get("play")
+            if video_url:
+                # tikwm renvoie parfois des chemins relatifs
+                if video_url.startswith("/"):
+                    video_url = "https://www.tikwm.com" + video_url
+                print(f"  [tikwm POST] OK → {video_url[:80]}...")
+                return {"url": video_url, "headers": {"User-Agent": UA, "Referer": "https://www.tikwm.com/"}}
+            else:
+                print(f"  [tikwm POST] pas de champ play/hdplay")
+    except Exception as e:
+        print(f"  [tikwm POST] erreur: {e}")
+
+    # Méthode 2 : tikwm GET (fallback)
     try:
         r = http_requests.get(
             "https://www.tikwm.com/api/",
@@ -45,13 +76,16 @@ def extract_video_info(tiktok_url):
         data = r.json()
         if data.get("code") == 0:
             d = data["data"]
-            # "play" = vidéo sans watermark, "hdplay" = HD
-            # NE PAS utiliser "music" qui est juste l'audio
             video_url = d.get("hdplay") or d.get("play")
             if video_url:
+                if video_url.startswith("/"):
+                    video_url = "https://www.tikwm.com" + video_url
+                print(f"  [tikwm GET] OK → {video_url[:80]}...")
                 return {"url": video_url, "headers": {"User-Agent": UA, "Referer": "https://www.tikwm.com/"}}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [tikwm GET] erreur: {e}")
+
+    print(f"  [extract] ECHEC pour {tiktok_url}")
     return None
 
 
@@ -90,6 +124,16 @@ def index():
     return HTML_PAGE
 
 
+@app.route("/test_extract")
+def test_extract():
+    """Route de debug : teste tikwm avec une URL TikTok connue."""
+    test_url = request.args.get("url", "https://www.tiktok.com/@tiktok/video/7106594312292453678")
+    info = extract_video_info(test_url)
+    if info:
+        return f"OK — URL vidéo extraite: {info['url'][:100]}..."
+    return "ECHEC — tikwm n'a pas pu extraire la vidéo", 500
+
+
 @app.route("/stream/<video_id>")
 def stream_video(video_id):
     """Proxy la vidéo TikTok pour contourner CORS."""
@@ -97,15 +141,33 @@ def stream_video(video_id):
         info = video_cache.get(video_id)
     if not info:
         return "Vidéo non trouvée", 404
-    headers = {k: v for k, v in info["headers"].items()
-               if k.lower() in ("user-agent", "referer", "cookie", "accept")}
-    resp = http_requests.get(info["url"], headers=headers, stream=True, timeout=20)
+
+    headers = {}
+    for k, v in info["headers"].items():
+        if k.lower() in ("user-agent", "referer", "cookie", "accept"):
+            headers[k] = v
+
+    try:
+        resp = http_requests.get(info["url"], headers=headers, stream=True, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  [stream] Erreur proxy: {e}")
+        return f"Erreur proxy: {e}", 502
+
+    content_type = resp.headers.get("Content-Type", "video/mp4")
 
     def generate():
         for chunk in resp.iter_content(chunk_size=64 * 1024):
             yield chunk
 
-    return Response(generate(), content_type="video/mp4", headers={"Accept-Ranges": "bytes"})
+    return Response(
+        generate(),
+        content_type=content_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
 
 
 # --- Socket.IO ---
@@ -275,13 +337,31 @@ def start_round(room_code):
     room["current_video"] = video
     room["current_owner"] = owner["pseudo"]
 
-    # Extraire la vidéo via tikwm
-    info = extract_video_info(video["url"])
+    # Extraire la vidéo via tikwm — retry jusqu'à 3 vidéos si échec
+    info = None
+    attempts = 0
+    while not info and attempts < 3:
+        print(f"  Extraction tentative {attempts+1} : {video['url']}")
+        info = extract_video_info(video["url"])
+        if not info:
+            attempts += 1
+            # Essayer une autre vidéo du même owner
+            other = [v for v in available if v["video_id"] != video["video_id"] and v["video_id"] not in room["used_videos"]]
+            if other:
+                video = random.choice(other)
+                room["used_videos"].add(video["video_id"])
+                room["current_video"] = video
+            else:
+                break
+
     stream_url = None
     if info and info["url"]:
         with cache_lock:
             video_cache[video["video_id"]] = info
         stream_url = f"/stream/{video['video_id']}"
+        print(f"  ✓ Vidéo prête: /stream/{video['video_id']}")
+    else:
+        print(f"  ✗ Impossible d'extraire la vidéo après {attempts} tentatives")
 
     round_data = {
         "round": room["current_round"],
