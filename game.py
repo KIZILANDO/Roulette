@@ -53,7 +53,7 @@ def extract_video_info(tiktok_url):
             d = data["data"]
             # "play" = vidéo sans watermark, "hdplay" = HD
             # NE PAS utiliser "music" / "music_info" qui est juste l'audio
-            video_url = d.get("hdplay") or d.get("play")
+            video_url = d.get("play") or d.get("hdplay")
             if video_url:
                 # tikwm renvoie parfois des chemins relatifs
                 if video_url.startswith("/"):
@@ -76,7 +76,7 @@ def extract_video_info(tiktok_url):
         data = r.json()
         if data.get("code") == 0:
             d = data["data"]
-            video_url = d.get("hdplay") or d.get("play")
+            video_url = d.get("play") or d.get("hdplay")
             if video_url:
                 if video_url.startswith("/"):
                     video_url = "https://www.tikwm.com" + video_url
@@ -717,47 +717,18 @@ function renderScoreboard(scores, containerId) {
     ).join('');
 }
 
-// --- Chargement vidéo : 3 méthodes en cascade ---
+// --- Chargement vidéo ---
 async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
-  // Méthode 1 : URL directe envoyée par le serveur
+  // Méthode 1 : Proxy serveur (même domaine = marche sur PC + mobile)
+  if (videoId) {
+    console.log('[video] Essai proxy /stream/...');
+    if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
+  }
+
+  // Méthode 2 : URL directe (fallback, marche surtout sur PC)
   if (directUrl) {
     console.log('[video] Essai URL directe...');
     if (await tryPlayVideo(directUrl, wrapper)) return;
-  }
-
-  // Méthode 2 : Extraction côté client via tikwm (IP du joueur)
-  console.log('[video] Essai tikwm côté client...');
-  try {
-    const r = await fetch('https://www.tikwm.com/api/', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'url=' + encodeURIComponent(tiktokUrl) + '&hd=1',
-    });
-    const data = await r.json();
-    if (data.code === 0) {
-      let vurl = data.data.hdplay || data.data.play;
-      if (vurl) {
-        if (vurl.startsWith('/')) vurl = 'https://www.tikwm.com' + vurl;
-        console.log('[video] tikwm client OK');
-        if (await tryPlayVideo(vurl, wrapper)) return;
-      }
-    }
-  } catch(e) {
-    console.log('[video] tikwm client CORS/erreur:', e.message);
-  }
-
-  // Méthode 3 : Proxy serveur (API extract + stream)
-  console.log('[video] Essai via proxy serveur...');
-  try {
-    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl));
-    const data = await r.json();
-    if (data.video_url) {
-      // Essayer direct d'abord, puis proxy
-      if (await tryPlayVideo(data.video_url, wrapper)) return;
-      if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
-    }
-  } catch(e) {
-    console.log('[video] proxy erreur:', e.message);
   }
 
   wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
@@ -767,9 +738,7 @@ function tryPlayVideo(url, wrapper) {
   return new Promise(resolve => {
     const video = document.createElement('video');
     video.controls = true;
-    video.autoplay = true;
     video.playsInline = true;
-    video.muted = true;
     video.setAttribute('webkit-playsinline', 'true');
     video.setAttribute('playsinline', '');
     video.preload = 'auto';
@@ -780,9 +749,8 @@ function tryPlayVideo(url, wrapper) {
 
     const timeout = setTimeout(() => {
       console.log('[video] Timeout pour', url.substring(0, 60));
-      // Si la vidéo a une durée, c'est qu'elle charge quand même
       if (video.readyState >= 2) { done(true); return; }
-      wrapper.removeChild(video);
+      if (video.parentNode) video.parentNode.removeChild(video);
       done(false);
     }, 15000);
 
@@ -790,8 +758,6 @@ function tryPlayVideo(url, wrapper) {
       video.onloadeddata = null;
       video.oncanplay = null;
       video.play().catch(() => {});
-      // Ajouter bouton unmute
-      addUnmuteBtn(wrapper, video);
       done(true);
     };
 
@@ -800,7 +766,7 @@ function tryPlayVideo(url, wrapper) {
 
     video.onerror = () => {
       console.log('[video] Erreur pour', url.substring(0, 60));
-      wrapper.removeChild(video);
+      if (video.parentNode) video.parentNode.removeChild(video);
       done(false);
     };
 
@@ -810,18 +776,6 @@ function tryPlayVideo(url, wrapper) {
     video.src = url;
     video.load();
   });
-}
-
-function addUnmuteBtn(wrapper, video) {
-  if (!video.muted) return;
-  const btn = document.createElement('button');
-  btn.textContent = '🔇 Appuie pour le son';
-  btn.style.cssText = 'position:absolute;bottom:16px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.7);color:#fff;border:2px solid #25f4ee;border-radius:30px;padding:10px 22px;font-size:.9rem;font-weight:600;cursor:pointer;z-index:10;backdrop-filter:blur(4px)';
-  wrapper.style.position = 'relative';
-  wrapper.appendChild(btn);
-  btn.onclick = () => { video.muted = false; btn.remove(); };
-  // Auto-remove après 8s si pas cliqué
-  setTimeout(() => { if (btn.parentNode) btn.remove(); }, 8000);
 }
 
 // --- Socket events ---
