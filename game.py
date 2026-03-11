@@ -53,7 +53,7 @@ def extract_video_info(tiktok_url):
             d = data["data"]
             # "play" = vidéo sans watermark, "hdplay" = HD
             # NE PAS utiliser "music" / "music_info" qui est juste l'audio
-            video_url = d.get("play") or d.get("hdplay")
+            video_url = d.get("hdplay") or d.get("play")
             if video_url:
                 # tikwm renvoie parfois des chemins relatifs
                 if video_url.startswith("/"):
@@ -76,7 +76,7 @@ def extract_video_info(tiktok_url):
         data = r.json()
         if data.get("code") == 0:
             d = data["data"]
-            video_url = d.get("play") or d.get("hdplay")
+            video_url = d.get("hdplay") or d.get("play")
             if video_url:
                 if video_url.startswith("/"):
                     video_url = "https://www.tikwm.com" + video_url
@@ -717,18 +717,47 @@ function renderScoreboard(scores, containerId) {
     ).join('');
 }
 
-// --- Chargement vidéo ---
+// --- Chargement vidéo : 3 méthodes en cascade ---
 async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
-  // Méthode 1 : Proxy serveur (même domaine = marche sur PC + mobile)
-  if (videoId) {
-    console.log('[video] Essai proxy /stream/...');
-    if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
-  }
-
-  // Méthode 2 : URL directe (fallback, marche surtout sur PC)
+  // Méthode 1 : URL directe envoyée par le serveur
   if (directUrl) {
     console.log('[video] Essai URL directe...');
     if (await tryPlayVideo(directUrl, wrapper)) return;
+  }
+
+  // Méthode 2 : Extraction côté client via tikwm (IP du joueur)
+  console.log('[video] Essai tikwm côté client...');
+  try {
+    const r = await fetch('https://www.tikwm.com/api/', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'url=' + encodeURIComponent(tiktokUrl) + '&hd=1',
+    });
+    const data = await r.json();
+    if (data.code === 0) {
+      let vurl = data.data.hdplay || data.data.play;
+      if (vurl) {
+        if (vurl.startsWith('/')) vurl = 'https://www.tikwm.com' + vurl;
+        console.log('[video] tikwm client OK');
+        if (await tryPlayVideo(vurl, wrapper)) return;
+      }
+    }
+  } catch(e) {
+    console.log('[video] tikwm client CORS/erreur:', e.message);
+  }
+
+  // Méthode 3 : Proxy serveur (API extract + stream)
+  console.log('[video] Essai via proxy serveur...');
+  try {
+    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl));
+    const data = await r.json();
+    if (data.video_url) {
+      // Essayer direct d'abord, puis proxy
+      if (await tryPlayVideo(data.video_url, wrapper)) return;
+      if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
+    }
+  } catch(e) {
+    console.log('[video] proxy erreur:', e.message);
   }
 
   wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
@@ -738,43 +767,30 @@ function tryPlayVideo(url, wrapper) {
   return new Promise(resolve => {
     const video = document.createElement('video');
     video.controls = true;
+    video.autoplay = true;
     video.playsInline = true;
-    video.setAttribute('webkit-playsinline', 'true');
-    video.setAttribute('playsinline', '');
-    video.preload = 'auto';
     video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
-
-    let resolved = false;
-    const done = (ok) => { if (!resolved) { resolved = true; clearTimeout(timeout); resolve(ok); } };
 
     const timeout = setTimeout(() => {
       console.log('[video] Timeout pour', url.substring(0, 60));
-      if (video.readyState >= 2) { done(true); return; }
-      if (video.parentNode) video.parentNode.removeChild(video);
-      done(false);
+      resolve(false);
     }, 15000);
 
-    const onReady = () => {
-      video.onloadeddata = null;
-      video.oncanplay = null;
+    video.onloadeddata = () => {
+      clearTimeout(timeout);
+      wrapper.innerHTML = '';
+      wrapper.appendChild(video);
       video.play().catch(() => {});
-      done(true);
+      resolve(true);
     };
-
-    video.onloadeddata = onReady;
-    video.oncanplay = onReady;
 
     video.onerror = () => {
+      clearTimeout(timeout);
       console.log('[video] Erreur pour', url.substring(0, 60));
-      if (video.parentNode) video.parentNode.removeChild(video);
-      done(false);
+      resolve(false);
     };
 
-    // Attacher au DOM AVANT de set src (nécessaire sur mobile)
-    wrapper.innerHTML = '';
-    wrapper.appendChild(video);
     video.src = url;
-    video.load();
   });
 }
 
@@ -841,7 +857,6 @@ socket.on('new_round', data => {
 
   // Video — 3 méthodes en cascade
   const wrapper = document.getElementById('videoWrapper');
-  wrapper.style.position = 'relative';
   wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vidéo...</div>';
   loadVideo(data.direct_url, data.tiktok_url, data.video_id, wrapper);
 
