@@ -11,60 +11,12 @@ import os
 import random
 import re
 import string
-import threading
-from flask import Flask, request, jsonify, Response, send_from_directory
+from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room as sio_join_room
-import requests as http_requests
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=16 * 1024 * 1024)
-
-# --- Extraction vidéo TikTok ---
-
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
-
-video_cache = {}
-cache_lock = threading.Lock()
-
-
-def extract_video_info(tiktok_url):
-    try:
-        r = http_requests.get(
-            "https://www.tikwm.com/api/",
-            params={"url": tiktok_url, "hd": "1"},
-            headers={"User-Agent": UA, "Referer": "https://www.tikwm.com/"},
-            timeout=10,
-        )
-        data = r.json()
-        if data.get("code") == 0:
-            video_url = data["data"].get("play") or data["data"].get("hdplay")
-            if video_url:
-                return {"url": video_url, "headers": {"User-Agent": UA}}
-    except Exception:
-        pass
-
-    m = re.search(r"video/(\d+)", tiktok_url)
-    if m:
-        try:
-            r = http_requests.get(
-                "https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/",
-                params={"aweme_id": m.group(1), "version_code": "262", "app_name": "tiktok_web"},
-                headers={"User-Agent": "okhttp/3.10.0.1", "Accept": "application/json"},
-                timeout=8,
-            )
-            awemes = r.json().get("aweme_list", [])
-            if awemes:
-                urls = awemes[0]["video"]["play_addr"]["url_list"]
-                if urls:
-                    return {"url": urls[0], "headers": {"User-Agent": UA}}
-        except Exception:
-            pass
-    return None
 
 
 def parse_urls(text):
@@ -100,23 +52,6 @@ sid_to_room = {}
 @app.route("/")
 def index():
     return HTML_PAGE
-
-
-@app.route("/stream/<video_id>")
-def stream_video(video_id):
-    with cache_lock:
-        info = video_cache.get(video_id)
-    if not info:
-        return "Vidéo non trouvée", 404
-    headers = {k: v for k, v in info["headers"].items()
-               if k.lower() in ("user-agent", "referer", "cookie", "accept")}
-    resp = http_requests.get(info["url"], headers=headers, stream=True, timeout=15)
-
-    def generate():
-        for chunk in resp.iter_content(chunk_size=64 * 1024):
-            yield chunk
-
-    return Response(generate(), content_type="video/mp4", headers={"Accept-Ranges": "bytes"})
 
 
 # --- Socket.IO ---
@@ -286,18 +221,10 @@ def start_round(room_code):
     room["current_video"] = video
     room["current_owner"] = owner["pseudo"]
 
-    # Extract video for streaming
-    info = extract_video_info(video["url"])
-    stream_url = None
-    if info and info["url"]:
-        with cache_lock:
-            video_cache[video["video_id"]] = info
-        stream_url = f"/stream/{video['video_id']}"
-
     round_data = {
         "round": room["current_round"],
         "total_rounds": room["num_rounds"],
-        "stream_url": stream_url,
+        "video_id": video["video_id"],
         "tiktok_url": video["url"],
         "author": video["author"],
         "players": [p["pseudo"] for p in room["players"].values()],
@@ -458,8 +385,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .file-upload.done{border-color:#25f4ee;background:#25f4ee0a}
   .file-upload.done .label{color:#25f4ee}
   .error-msg{color:#fe2c55;font-size:.85rem;margin:8px 0;min-height:20px}
-  .video-wrapper{width:100%;max-width:400px;margin:0 auto;border-radius:16px;overflow:hidden;background:#111;box-shadow:0 10px 40px rgba(0,0,0,.5)}
-  .video-wrapper video{width:100%;max-height:65vh;background:#000;display:block}
+  .video-wrapper{width:100%;max-width:340px;margin:0 auto;border-radius:16px;overflow:hidden;background:#111;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  .video-wrapper iframe{width:100%;height:700px;border:none;display:block}
   .round-info{margin:15px 0;font-size:.9rem;color:#888}
   .round-badge{display:inline-block;background:#25f4ee22;color:#25f4ee;padding:6px 16px;border-radius:20px;font-weight:700;font-size:.85rem;margin-bottom:10px}
   .owner-alert{background:linear-gradient(135deg,#fe2c5522,#ff6b8122);border:2px solid #fe2c55;border-radius:12px;padding:16px;margin:12px 0;font-weight:600;color:#fe2c55;font-size:.95rem}
@@ -710,10 +637,10 @@ socket.on('new_round', data => {
   const ownerAlert = document.getElementById('ownerAlert');
   ownerAlert.style.display = data.is_yours ? 'block' : 'none';
 
-  // Video
+  // Video — TikTok embed
   const wrapper = document.getElementById('videoWrapper');
-  if (data.stream_url) {
-    wrapper.innerHTML = '<video controls autoplay playsinline><source src="' + data.stream_url + '" type="video/mp4"></video>';
+  if (data.video_id) {
+    wrapper.innerHTML = '<iframe src="https://www.tiktok.com/embed/v2/' + data.video_id + '" allowfullscreen allow="encrypted-media"></iframe>';
   } else {
     wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo</div>';
   }
