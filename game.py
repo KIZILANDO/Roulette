@@ -31,6 +31,8 @@ UA = (
 
 video_cache = {}
 cache_lock = threading.Lock()
+video_bytes_cache = {}
+bytes_cache_lock = threading.Lock()
 
 
 def extract_video_info(tiktok_url):
@@ -136,7 +138,21 @@ def test_extract():
 
 @app.route("/stream/<video_id>")
 def stream_video(video_id):
-    """Proxy la vidéo TikTok pour contourner CORS."""
+    """Sert la vidéo pré-téléchargée depuis le cache mémoire."""
+    # Servir depuis le cache bytes (pré-téléchargé au début du round)
+    with bytes_cache_lock:
+        cached = video_bytes_cache.get(video_id)
+    if cached:
+        return Response(
+            cached["bytes"],
+            content_type=cached["content_type"],
+            headers={
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    # Fallback : proxy streaming si pas dans le cache bytes
     with cache_lock:
         info = video_cache.get(video_id)
     if not info:
@@ -148,7 +164,7 @@ def stream_video(video_id):
             headers[k] = v
 
     try:
-        resp = http_requests.get(info["url"], headers=headers, stream=True, timeout=30)
+        resp = http_requests.get(info["url"], headers=headers, timeout=30)
         resp.raise_for_status()
     except Exception as e:
         print(f"  [stream] Erreur proxy: {e}")
@@ -156,12 +172,12 @@ def stream_video(video_id):
 
     content_type = resp.headers.get("Content-Type", "video/mp4")
 
-    def generate():
-        for chunk in resp.iter_content(chunk_size=64 * 1024):
-            yield chunk
+    # Cacher les bytes pour les prochaines requêtes
+    with bytes_cache_lock:
+        video_bytes_cache[video_id] = {"bytes": resp.content, "content_type": content_type}
 
     return Response(
-        generate(),
+        resp.content,
         content_type=content_type,
         headers={
             "Accept-Ranges": "bytes",
@@ -349,22 +365,34 @@ def start_round(room_code):
     room["current_video"] = video
     room["current_owner"] = owner["pseudo"]
 
-    # Extraire la vidéo via tikwm côté serveur
-    direct_url = None
+    # Extraire et pré-télécharger la vidéo côté serveur
+    video_ready = False
     info = extract_video_info(video["url"])
     if info and info["url"]:
-        direct_url = info["url"]
-        # Stocker dans le cache pour le proxy /stream/ (fallback)
         with cache_lock:
             video_cache[video["video_id"]] = info
-        print(f"  ✓ URL directe extraite pour {video['video_id']}")
+        # Pré-télécharger les bytes pour servir tous les joueurs via /stream/
+        try:
+            dl_headers = {k: v for k, v in info["headers"].items()
+                         if k.lower() in ("user-agent", "referer", "cookie", "accept")}
+            resp = http_requests.get(info["url"], headers=dl_headers, timeout=30)
+            resp.raise_for_status()
+            ct = resp.headers.get("Content-Type", "video/mp4")
+            with bytes_cache_lock:
+                # Garder seulement la vidéo du round en cours pour économiser la RAM
+                video_bytes_cache.clear()
+                video_bytes_cache[video["video_id"]] = {"bytes": resp.content, "content_type": ct}
+            video_ready = True
+            print(f"  ✓ Vidéo {video['video_id']} pré-téléchargée ({len(resp.content) // 1024} KB)")
+        except Exception as e:
+            print(f"  ✗ Pré-téléchargement échoué: {e}")
     else:
         print(f"  ✗ Extraction serveur échouée, le client fera l'extraction")
 
     round_data = {
         "round": room["current_round"],
         "total_rounds": room["num_rounds"],
-        "direct_url": direct_url,
+        "video_ready": video_ready,
         "tiktok_url": video["url"],
         "video_id": video["video_id"],
         "author": video["author"],
@@ -717,15 +745,27 @@ function renderScoreboard(scores, containerId) {
     ).join('');
 }
 
-// --- Chargement vidéo : 3 méthodes en cascade ---
-async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
-  // Méthode 1 : URL directe envoyée par le serveur
-  if (directUrl) {
-    console.log('[video] Essai URL directe...');
-    if (await tryPlayVideo(directUrl, wrapper)) return;
+// --- Chargement vidéo : proxy serveur en priorité ---
+async function loadVideo(videoReady, tiktokUrl, videoId, wrapper) {
+  // Méthode 1 : Proxy serveur (vidéo pré-téléchargée, fiable pour tous les joueurs)
+  if (videoReady) {
+    console.log('[video] Essai proxy serveur (pré-téléchargée)...');
+    if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
   }
 
-  // Méthode 2 : Extraction côté client via tikwm (IP du joueur)
+  // Méthode 2 : Proxy serveur via extraction à la demande
+  console.log('[video] Essai extraction serveur...');
+  try {
+    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl));
+    const data = await r.json();
+    if (data.video_url) {
+      if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
+    }
+  } catch(e) {
+    console.log('[video] extract erreur:', e.message);
+  }
+
+  // Méthode 3 : Extraction côté client via tikwm (dernier recours)
   console.log('[video] Essai tikwm côté client...');
   try {
     const r = await fetch('https://www.tikwm.com/api/', {
@@ -744,20 +784,6 @@ async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
     }
   } catch(e) {
     console.log('[video] tikwm client CORS/erreur:', e.message);
-  }
-
-  // Méthode 3 : Proxy serveur (API extract + stream)
-  console.log('[video] Essai via proxy serveur...');
-  try {
-    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl));
-    const data = await r.json();
-    if (data.video_url) {
-      // Essayer direct d'abord, puis proxy
-      if (await tryPlayVideo(data.video_url, wrapper)) return;
-      if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
-    }
-  } catch(e) {
-    console.log('[video] proxy erreur:', e.message);
   }
 
   wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
@@ -858,7 +884,7 @@ socket.on('new_round', data => {
   // Video — 3 méthodes en cascade
   const wrapper = document.getElementById('videoWrapper');
   wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vidéo...</div>';
-  loadVideo(data.direct_url, data.tiktok_url, data.video_id, wrapper);
+  loadVideo(data.video_ready, data.tiktok_url, data.video_id, wrapper);
 
   // Vote section
   const voteSection = document.getElementById('voteSection');
