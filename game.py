@@ -773,25 +773,53 @@ function renderScoreboard(scores, containerId) {
     ).join('');
 }
 
-// --- Chargement vidéo : proxy serveur en priorité ---
-async function loadVideo(videoReady, tiktokUrl, videoId, wrapper) {
-  // Méthode 1 : Proxy serveur (vidéo pré-téléchargée, fiable pour tous les joueurs)
-  console.log('[video] Essai proxy serveur...');
-  if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
+// --- Chargement vidéo : télécharge en blob puis joue ---
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  // Méthode 2 : Proxy serveur via extraction à la demande
-  console.log('[video] Essai extraction serveur...');
-  try {
-    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl) + '&video_id=' + encodeURIComponent(videoId));
-    const data = await r.json();
-    if (data.video_url) {
-      if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
+async function fetchVideoBlob(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const blob = await resp.blob();
+  if (blob.size < 1000) throw new Error('Réponse trop petite (' + blob.size + ' bytes)');
+  return blob;
+}
+
+async function loadVideo(videoReady, tiktokUrl, videoId, wrapper) {
+  const streamUrl = '/stream/' + videoId;
+
+  // Essai 1-3 : Proxy serveur avec retries (vidéo pré-téléchargée côté serveur)
+  for (let i = 0; i < 3; i++) {
+    if (i > 0) {
+      wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Réessai ' + (i+1) + '/3...</div>';
+      await delay(2000 + i * 1000);
     }
-  } catch(e) {
-    console.log('[video] extract erreur:', e.message);
+    console.log('[video] Essai proxy serveur, tentative ' + (i+1));
+    try {
+      const blob = await fetchVideoBlob(streamUrl);
+      console.log('[video] Blob reçu:', blob.size, 'bytes');
+      playBlob(blob, wrapper);
+      return;
+    } catch(e) {
+      console.log('[video] Proxy échoué:', e.message);
+    }
   }
 
-  // Méthode 3 : Extraction côté client via tikwm (dernier recours)
+  // Essai 4 : Forcer extraction serveur + retry stream
+  console.log('[video] Essai extraction serveur à la demande...');
+  wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Extraction en cours...</div>';
+  try {
+    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl) + '&video_id=' + encodeURIComponent(videoId));
+    if (r.ok) {
+      await delay(1000);
+      const blob = await fetchVideoBlob(streamUrl);
+      playBlob(blob, wrapper);
+      return;
+    }
+  } catch(e) {
+    console.log('[video] Extract+stream échoué:', e.message);
+  }
+
+  // Essai 5 : tikwm côté client (dernier recours)
   console.log('[video] Essai tikwm côté client...');
   try {
     const r = await fetch('https://www.tikwm.com/api/', {
@@ -804,50 +832,36 @@ async function loadVideo(videoReady, tiktokUrl, videoId, wrapper) {
       let vurl = data.data.hdplay || data.data.play;
       if (vurl) {
         if (vurl.startsWith('/')) vurl = 'https://www.tikwm.com' + vurl;
-        console.log('[video] tikwm client OK');
-        if (await tryPlayVideo(vurl, wrapper)) return;
+        const blob = await fetchVideoBlob(vurl);
+        playBlob(blob, wrapper);
+        return;
       }
     }
   } catch(e) {
-    console.log('[video] tikwm client CORS/erreur:', e.message);
+    console.log('[video] tikwm client échoué:', e.message);
   }
 
-  wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
+  wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕<br><button class="btn btn-small btn-secondary" onclick="retryVideo()" style="margin-top:10px">🔄 Réessayer</button></div>';
 }
 
-function tryPlayVideo(url, wrapper) {
-  return new Promise(resolve => {
-    const video = document.createElement('video');
-    video.controls = true;
-    video.autoplay = true;
-    video.playsInline = true;
-    video.muted = true;
-    video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
+let lastVideoArgs = null;
+function retryVideo() {
+  if (lastVideoArgs) loadVideo(...lastVideoArgs);
+}
 
-    const timeout = setTimeout(() => {
-      console.log('[video] Timeout pour', url.substring(0, 60));
-      video.src = '';
-      resolve(false);
-    }, 20000);
-
-    video.oncanplay = () => {
-      clearTimeout(timeout);
-      wrapper.innerHTML = '';
-      wrapper.appendChild(video);
-      video.muted = false;
-      video.play().catch(() => { video.muted = true; video.play().catch(() => {}); });
-      resolve(true);
-    };
-
-    video.onerror = () => {
-      clearTimeout(timeout);
-      console.log('[video] Erreur pour', url.substring(0, 60));
-      video.src = '';
-      resolve(false);
-    };
-
-    video.src = url;
-  });
+function playBlob(blob, wrapper) {
+  const blobUrl = URL.createObjectURL(blob);
+  const video = document.createElement('video');
+  video.controls = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = true;
+  video.preload = 'auto';
+  video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
+  video.src = blobUrl;
+  wrapper.innerHTML = '';
+  wrapper.appendChild(video);
+  video.play().then(() => { video.muted = false; }).catch(() => { video.muted = true; video.play().catch(() => {}); });
 }
 
 // --- Socket events ---
@@ -914,6 +928,7 @@ socket.on('new_round', data => {
   // Video — 3 méthodes en cascade
   const wrapper = document.getElementById('videoWrapper');
   wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vidéo...</div>';
+  lastVideoArgs = [data.video_ready, data.tiktok_url, data.video_id, wrapper];
   loadVideo(data.video_ready, data.tiktok_url, data.video_id, wrapper);
 
   // Vote section
