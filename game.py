@@ -350,11 +350,13 @@ def start_round(room_code):
     room["current_owner"] = owner["pseudo"]
 
     # Extraire la vidéo via tikwm côté serveur
-    # On envoie l'URL directe au client (pas de proxy)
     direct_url = None
     info = extract_video_info(video["url"])
     if info and info["url"]:
         direct_url = info["url"]
+        # Stocker dans le cache pour le proxy /stream/ (fallback)
+        with cache_lock:
+            video_cache[video["video_id"]] = info
         print(f"  ✓ URL directe extraite pour {video['video_id']}")
     else:
         print(f"  ✗ Extraction serveur échouée, le client fera l'extraction")
@@ -767,13 +769,12 @@ function tryPlayVideo(url, wrapper) {
     video.controls = true;
     video.autoplay = true;
     video.playsInline = true;
-    video.crossOrigin = 'anonymous';
     video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
 
     const timeout = setTimeout(() => {
       console.log('[video] Timeout pour', url.substring(0, 60));
       resolve(false);
-    }, 8000);
+    }, 15000);
 
     video.onloadeddata = () => {
       clearTimeout(timeout);
