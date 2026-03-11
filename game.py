@@ -52,9 +52,9 @@ def extract_video_info(tiktok_url):
         data = r.json()
         if data.get("code") == 0:
             d = data["data"]
-            # "play" = vidéo sans watermark, "hdplay" = HD
-            # NE PAS utiliser "music" / "music_info" qui est juste l'audio
-            video_url = d.get("hdplay") or d.get("play")
+            # "play" = vidéo sans watermark (souvent hébergée tikwm), "hdplay" = HD (souvent CDN TikTok)
+            # Préférer play car téléchargeable depuis un serveur cloud
+            video_url = d.get("play") or d.get("hdplay")
             if video_url:
                 # tikwm renvoie parfois des chemins relatifs
                 if video_url.startswith("/"):
@@ -77,7 +77,7 @@ def extract_video_info(tiktok_url):
         data = r.json()
         if data.get("code") == 0:
             d = data["data"]
-            video_url = d.get("hdplay") or d.get("play")
+            video_url = d.get("play") or d.get("hdplay")
             if video_url:
                 if video_url.startswith("/"):
                     video_url = "https://www.tikwm.com" + video_url
@@ -347,19 +347,21 @@ def start_round(room_code):
     room["current_owner"] = owner["pseudo"]
 
     # Extraire + pré-télécharger la vidéo côté serveur
+    direct_url = None
     info = extract_video_info(video["url"])
     if info and info["url"]:
+        direct_url = info["url"]
         with cache_lock:
             video_cache[video["video_id"]] = info
-        # Pré-télécharger les bytes pour servir à tous les joueurs
+        # Pré-télécharger les bytes (marche en local, peut échouer sur Render)
         try:
-            resp = http_requests.get(info["url"], headers=info["headers"], timeout=30)
+            resp = http_requests.get(info["url"], headers=info["headers"], timeout=20)
             resp.raise_for_status()
             with cache_lock:
                 video_bytes_cache[video["video_id"]] = resp.content
             print(f"  ✓ Vidéo pré-téléchargée pour {video['video_id']} ({len(resp.content)//1024}KB)")
         except Exception as e:
-            print(f"  ⚠ Pré-téléchargement échoué: {e}")
+            print(f"  ⚠ Pré-téléchargement échoué (le client utilisera l'URL directe): {e}")
     else:
         print(f"  ✗ Extraction serveur échouée")
 
@@ -367,6 +369,7 @@ def start_round(room_code):
         "round": room["current_round"],
         "total_rounds": room["num_rounds"],
         "video_id": video["video_id"],
+        "direct_url": direct_url,
         "tiktok_url": video["url"],
         "author": video["author"],
         "players": [p["pseudo"] for p in room["players"].values()],
@@ -719,7 +722,7 @@ function renderScoreboard(scores, containerId) {
 }
 
 // --- Chargement vidéo ---
-function loadVideo(videoId, wrapper) {
+function loadVideo(videoId, directUrl, wrapper) {
   const video = document.createElement('video');
   video.controls = true;
   video.playsInline = true;
@@ -727,11 +730,21 @@ function loadVideo(videoId, wrapper) {
   video.preload = 'auto';
   video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
 
+  let triedDirect = false;
+
   video.onloadeddata = () => {
     video.play().catch(() => {});
   };
 
   video.onerror = () => {
+    // Si le proxy a échoué, essayer l'URL directe (navigateur du joueur)
+    if (!triedDirect && directUrl) {
+      console.log('[video] Proxy échoué, essai URL directe...');
+      triedDirect = true;
+      video.src = directUrl;
+      video.load();
+      return;
+    }
     wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
   };
 
@@ -802,10 +815,10 @@ socket.on('new_round', data => {
   const ownerAlert = document.getElementById('ownerAlert');
   ownerAlert.style.display = data.is_yours ? 'block' : 'none';
 
-  // Video — servie depuis le proxy serveur
+  // Video
   const wrapper = document.getElementById('videoWrapper');
   wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vidéo...</div>';
-  loadVideo(data.video_id, wrapper);
+  loadVideo(data.video_id, data.direct_url, wrapper);
 
   // Vote section
   const voteSection = document.getElementById('voteSection');
