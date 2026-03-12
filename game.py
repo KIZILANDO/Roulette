@@ -718,10 +718,12 @@ function renderScoreboard(scores, containerId) {
 }
 
 // --- Chargement vidéo : 3 méthodes en cascade ---
-async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
+async function loadVideo(directUrl, tiktokUrl, videoId, wrapper, attempt) {
+  attempt = attempt || 1;
+  const maxAttempts = 5;
   // Méthode 1 : URL directe envoyée par le serveur
   if (directUrl) {
-    console.log('[video] Essai URL directe...');
+    console.log('[video] Essai URL directe (tentative ' + attempt + ')...');
     if (await tryPlayVideo(directUrl, wrapper)) return;
   }
 
@@ -760,6 +762,12 @@ async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
     console.log('[video] proxy erreur:', e.message);
   }
 
+  if (attempt < maxAttempts) {
+    console.log('[video] Echec, nouvelle tentative dans 2s (' + attempt + '/' + maxAttempts + ')...');
+    wrapper.innerHTML = '<div style="padding:30px;color:#888"><span class="loading-spinner"></span>Nouvelle tentative dans 2s... (' + attempt + '/' + maxAttempts + ')</div>';
+    await new Promise(r => setTimeout(r, 2000));
+    return loadVideo(directUrl, tiktokUrl, videoId, wrapper, attempt + 1);
+  }
   wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
 }
 
