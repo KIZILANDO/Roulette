@@ -51,6 +51,10 @@ def extract_video_info(tiktok_url):
         data = r.json()
         if data.get("code") == 0:
             d = data["data"]
+            # Détecter les carrousels (pas de vraie vidéo, juste audio)
+            if d.get("images"):
+                print(f"  [tikwm POST] carrousel détecté, ignoré")
+                return "carousel"
             # "play" = vidéo sans watermark, "hdplay" = HD
             # NE PAS utiliser "music" / "music_info" qui est juste l'audio
             video_url = d.get("play") or d.get("hdplay")
@@ -76,6 +80,9 @@ def extract_video_info(tiktok_url):
         data = r.json()
         if data.get("code") == 0:
             d = data["data"]
+            if d.get("images"):
+                print(f"  [tikwm GET] carrousel détecté, ignoré")
+                return "carousel"
             video_url = d.get("play") or d.get("hdplay")
             if video_url:
                 if video_url.startswith("/"):
@@ -342,17 +349,43 @@ def start_round(room_code):
         end_game(room_code)
         return
 
-    owner_sid, owner = random.choice(eligible)
-    available = [v for v in owner["videos"] if v["video_id"] not in room["used_videos"]]
-    video = random.choice(available)
+    # Chercher une vraie vidéo (pas un carrousel)
+    max_picks = 10
+    video = None
+    owner_sid = None
+    owner = None
+    for _try in range(max_picks):
+        owner_sid, owner = random.choice(eligible)
+        available = [v for v in owner["videos"] if v["video_id"] not in room["used_videos"]]
+        if not available:
+            continue
+        candidate = random.choice(available)
+        info = extract_video_info(candidate["url"])
+        if info == "carousel":
+            print(f"  ⏭ Carrousel ignoré ({candidate['video_id']}), on en choisit un autre")
+            room["used_videos"].add(candidate["video_id"])  # ne plus retomber dessus
+            # Recalculer eligible après exclusion
+            eligible = [
+                (sid, p) for sid, p in room["players"].items()
+                if any(v["video_id"] not in room["used_videos"] for v in p["videos"])
+            ]
+            if not eligible:
+                break
+            continue
+        video = candidate
+        break
+
+    if not video:
+        end_game(room_code)
+        return
+
     room["used_videos"].add(video["video_id"])
     room["current_video"] = video
     room["current_owner"] = owner["pseudo"]
 
     # Extraire la vidéo via tikwm côté serveur
     direct_url = None
-    info = extract_video_info(video["url"])
-    if info and info["url"]:
+    if info and info != "carousel" and info.get("url"):
         direct_url = info["url"]
         # Stocker dans le cache pour le proxy /stream/ (fallback)
         with cache_lock:
