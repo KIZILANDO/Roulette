@@ -12,7 +12,7 @@ import random
 import re
 import string
 import threading
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_file
 from flask_socketio import SocketIO, emit, join_room as sio_join_room
 import requests as http_requests
 
@@ -129,6 +129,19 @@ sid_to_room = {}
 @app.route("/")
 def index():
     return HTML_PAGE
+
+
+@app.route("/instructions")
+def instructions():
+    return INSTRUCTIONS_PAGE
+
+
+@app.route("/download/extension.zip")
+def download_extension():
+    zip_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension.zip")
+    if not os.path.isfile(zip_path):
+        return "Fichier extension.zip introuvable", 404
+    return send_file(zip_path, as_attachment=True, download_name="tiktok-extension.zip")
 
 
 @app.route("/test_extract")
@@ -597,7 +610,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="error-msg" id="homeError"></div>
   <button class="btn btn-primary" onclick="createRoom()">🏠 Créer une partie</button>
   <button class="btn btn-secondary" onclick="showJoin()">🚪 Rejoindre</button>
-  <a href="/instructions" class="btn btn-small" style="background:#333;margin-top:10px;text-decoration:none">📥 Obtenir l'extension Chrome</a>
+  <a href="/instructions" class="btn btn-small" style="background:#333;margin-top:12px;text-decoration:none">📦 Installer l'extension Chrome</a>
   <div id="joinSection" style="display:none;margin-top:15px">
     <input type="text" id="roomCodeInput" placeholder="Code de la room" maxlength="5" style="text-transform:uppercase;text-align:center;letter-spacing:4px;font-size:1.2rem">
     <button class="btn btn-secondary btn-small" onclick="joinRoom()">Rejoindre</button>
@@ -1028,59 +1041,110 @@ document.getElementById('roomCodeInput').addEventListener('keyup', e => {
 </body>
 </html>"""
 
-# --- Nouvelle route pour les instructions ---
 
-@app.route("/instructions")
-def instructions():
-    return '''
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Instructions</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                margin: 20px;
-                line-height: 1.6;
-            }
-            .container {
-                max-width: 600px;
-                margin: 0 auto;
-                text-align: center;
-            }
-            .btn-download {
-                display: inline-block;
-                margin-top: 20px;
-                padding: 10px 20px;
-                background-color: #007BFF;
-                color: white;
-                text-decoration: none;
-                border-radius: 5px;
-            }
-            .btn-download:hover {
-                background-color: #0056b3;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Comment installer l'extension</h1>
-            <p>Suivez les étapes ci-dessous pour installer l'extension Chrome :</p>
-            <ol>
-                <li>Téléchargez le fichier ZIP de l'extension en cliquant sur le bouton ci-dessous.</li>
-                <li>Extrayez le contenu du fichier ZIP dans un dossier local.</li>
-                <li>Ouvrez Chrome et accédez à <code>chrome://extensions/</code>.</li>
-                <li>Activez le <strong>Mode développeur</strong> (en haut à droite).</li>
-                <li>Cliquez sur <strong>Charger l'extension non empaquetée</strong>.</li>
-                <li>Sélectionnez le dossier extrait contenant les fichiers de l'extension.</li>
-            </ol>
-            <a href="/extension.zip" class="btn-download">Télécharger l'extension</a>
-        </div>
-    </body>
-    </html>
-    '''
+INSTRUCTIONS_PAGE = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Installer l'extension Chrome — TikTok Guess</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Inter',sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;justify-content:center;padding:30px 20px}
+  .container{width:100%;max-width:700px}
+  h1{font-size:2rem;font-weight:800;background:linear-gradient(135deg,#fe2c55,#25f4ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px;text-align:center}
+  .subtitle{color:#888;font-size:.85rem;margin-bottom:30px;text-align:center}
+  .back-link{display:inline-block;color:#25f4ee;text-decoration:none;font-size:.9rem;margin-bottom:20px;transition:opacity .2s}
+  .back-link:hover{opacity:.7}
+  .download-section{text-align:center;margin-bottom:35px}
+  .btn-download{display:inline-block;padding:16px 40px;font-size:1.1rem;font-weight:700;border:none;border-radius:50px;cursor:pointer;color:#fff;background:linear-gradient(135deg,#25f4ee,#00c9db);text-decoration:none;transition:all .3s;letter-spacing:.5px}
+  .btn-download:hover{transform:scale(1.05);box-shadow:0 0 25px rgba(37,244,238,.4)}
+  .step{background:#161622;border-radius:16px;padding:24px;margin-bottom:16px;border:2px solid #222}
+  .step-number{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#fe2c55,#ff6b81);font-weight:800;font-size:1rem;margin-right:12px;flex-shrink:0}
+  .step-header{display:flex;align-items:center;margin-bottom:12px}
+  .step-title{font-weight:700;font-size:1.05rem}
+  .step p{color:#aaa;font-size:.9rem;line-height:1.6}
+  .step code{background:#0a0a0a;color:#25f4ee;padding:2px 8px;border-radius:6px;font-size:.85rem}
+  .step .highlight{color:#25f4ee;font-weight:600}
+  .step img{max-width:100%;border-radius:10px;margin-top:12px;border:1px solid #333}
+  .note{background:#25f4ee11;border:1px solid #25f4ee33;border-radius:12px;padding:16px;margin-top:25px;font-size:.85rem;color:#aaa;line-height:1.6}
+  .note b{color:#25f4ee}
+</style>
+</head>
+<body>
+<div class="container">
+  <a href="/" class="back-link">← Retour au jeu</a>
+  <h1>📦 Installer l'extension Chrome</h1>
+  <p class="subtitle">Cette extension récupère les URLs de tes vidéos TikTok likées pour jouer au jeu</p>
+
+  <div class="download-section">
+    <a href="/download/extension.zip" class="btn-download">⬇ Télécharger l'extension (.zip)</a>
+  </div>
+
+  <div class="step">
+    <div class="step-header">
+      <span class="step-number">1</span>
+      <span class="step-title">Décompresser le fichier ZIP</span>
+    </div>
+    <p>Une fois le fichier <code>tiktok-extension.zip</code> téléchargé, fais un <span class="highlight">clic droit</span> dessus et choisis <span class="highlight">"Extraire tout..."</span> (Windows) ou double-clique dessus (Mac).<br>Tu obtiendras un dossier contenant les fichiers de l'extension.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-header">
+      <span class="step-number">2</span>
+      <span class="step-title">Ouvrir la page des extensions Chrome</span>
+    </div>
+    <p>Ouvre Google Chrome et tape dans la barre d'adresse :<br><code>chrome://extensions</code><br>puis appuie sur <span class="highlight">Entrée</span>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-header">
+      <span class="step-number">3</span>
+      <span class="step-title">Activer le mode développeur</span>
+    </div>
+    <p>En haut à droite de la page, active le bouton <span class="highlight">"Mode développeur"</span> (Developer mode).<br>De nouvelles options vont apparaître en haut de la page.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-header">
+      <span class="step-number">4</span>
+      <span class="step-title">Charger l'extension</span>
+    </div>
+    <p>Clique sur le bouton <span class="highlight">"Charger l'extension non empaquetée"</span> (Load unpacked) qui est apparu en haut à gauche.<br>Sélectionne le <span class="highlight">dossier décompressé</span> à l'étape 1 (celui qui contient <code>manifest.json</code>).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-header">
+      <span class="step-number">5</span>
+      <span class="step-title">Utiliser l'extension</span>
+    </div>
+    <p>L'extension est maintenant installée ! Pour l'utiliser :</p>
+    <p style="margin-top:8px">
+      1. Va sur <span class="highlight">TikTok</span> et connecte-toi à ton compte<br>
+      2. Va sur ton <span class="highlight">profil</span> → onglet <span class="highlight">"Vidéos aimées"</span> (❤️)<br>
+      3. <span class="highlight">Scrolle vers le bas</span> pour charger toutes tes vidéos likées<br>
+      4. Clique sur l'icône de l'extension 🧩 dans la barre Chrome, puis sur <span class="highlight">"TikTok Liked Videos Scraper"</span><br>
+      5. Clique sur <span class="highlight">"Scrape"</span> pour récupérer les URLs<br>
+      6. Clique sur <span class="highlight">"Télécharger"</span> pour sauvegarder le fichier <code>.txt</code>
+    </p>
+  </div>
+
+  <div class="step">
+    <div class="step-header">
+      <span class="step-number">6</span>
+      <span class="step-title">Rejoindre la partie</span>
+    </div>
+    <p>Retourne sur la page du jeu, entre ton pseudo, rejoins ou crée une room, puis <span class="highlight">upload le fichier .txt</span> généré par l'extension. C'est parti ! 🎮</p>
+  </div>
+
+  <div class="note">
+    <b>💡 Note :</b> L'extension ne collecte aucune donnée personnelle. Elle récupère uniquement les URLs des vidéos visibles sur la page de tes vidéos likées. Le fichier reste sur ton ordinateur jusqu'à ce que tu l'uploades dans le jeu.
+  </div>
+</div>
+</body>
+</html>"""
+
 
 # --- Lancement ---
 
