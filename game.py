@@ -597,6 +597,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="error-msg" id="homeError"></div>
   <button class="btn btn-primary" onclick="createRoom()">🏠 Créer une partie</button>
   <button class="btn btn-secondary" onclick="showJoin()">🚪 Rejoindre</button>
+  <a href="/instructions" class="btn btn-small" style="background:#333;margin-top:10px;text-decoration:none">📥 Obtenir l'extension Chrome</a>
   <div id="joinSection" style="display:none;margin-top:15px">
     <input type="text" id="roomCodeInput" placeholder="Code de la room" maxlength="5" style="text-transform:uppercase;text-align:center;letter-spacing:4px;font-size:1.2rem">
     <button class="btn btn-secondary btn-small" onclick="joinRoom()">Rejoindre</button>
@@ -1027,6 +1028,59 @@ document.getElementById('roomCodeInput').addEventListener('keyup', e => {
 </body>
 </html>"""
 
+# --- Nouvelle route pour les instructions ---
+
+@app.route("/instructions")
+def instructions():
+    return '''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Instructions</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                line-height: 1.6;
+            }
+            .container {
+                max-width: 600px;
+                margin: 0 auto;
+                text-align: center;
+            }
+            .btn-download {
+                display: inline-block;
+                margin-top: 20px;
+                padding: 10px 20px;
+                background-color: #007BFF;
+                color: white;
+                text-decoration: none;
+                border-radius: 5px;
+            }
+            .btn-download:hover {
+                background-color: #0056b3;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Comment installer l'extension</h1>
+            <p>Suivez les étapes ci-dessous pour installer l'extension Chrome :</p>
+            <ol>
+                <li>Téléchargez le fichier ZIP de l'extension en cliquant sur le bouton ci-dessous.</li>
+                <li>Extrayez le contenu du fichier ZIP dans un dossier local.</li>
+                <li>Ouvrez Chrome et accédez à <code>chrome://extensions/</code>.</li>
+                <li>Activez le <strong>Mode développeur</strong> (en haut à droite).</li>
+                <li>Cliquez sur <strong>Charger l'extension non empaquetée</strong>.</li>
+                <li>Sélectionnez le dossier extrait contenant les fichiers de l'extension.</li>
+            </ol>
+            <a href="/extension.zip" class="btn-download">Télécharger l'extension</a>
+        </div>
+    </body>
+    </html>
+    '''
 
 # --- Lancement ---
 
