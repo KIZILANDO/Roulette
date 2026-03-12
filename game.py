@@ -7,7 +7,6 @@ pip install flask flask-socketio requests
 python game.py
 """
 
-import base64
 import os
 import random
 import re
@@ -19,7 +18,7 @@ import requests as http_requests
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
-socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=50 * 1024 * 1024)
+socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=16 * 1024 * 1024)
 
 
 # --- Extraction vidéo TikTok via tikwm ---
@@ -32,8 +31,6 @@ UA = (
 
 video_cache = {}
 cache_lock = threading.Lock()
-video_bytes_cache = {}
-bytes_cache_lock = threading.Lock()
 
 
 def extract_video_info(tiktok_url):
@@ -42,7 +39,7 @@ def extract_video_info(tiktok_url):
     try:
         r = http_requests.post(
             "https://www.tikwm.com/api/",
-            data={"url": tiktok_url, "hd": "1"},
+            data={"url": tiktok_url, "hd": "0"},
             headers={
                 "User-Agent": UA,
                 "Referer": "https://www.tikwm.com/",
@@ -72,7 +69,7 @@ def extract_video_info(tiktok_url):
     try:
         r = http_requests.get(
             "https://www.tikwm.com/api/",
-            params={"url": tiktok_url, "hd": "1"},
+            params={"url": tiktok_url, "hd": "0"},
             headers={"User-Agent": UA, "Referer": "https://www.tikwm.com/"},
             timeout=15,
         )
@@ -137,73 +134,37 @@ def test_extract():
     return "ECHEC — tikwm n'a pas pu extraire la vidéo", 500
 
 
-def _ensure_bytes_cached(video_id):
-    """S'assure que les bytes de la vidéo sont en cache. Retourne le cache entry ou None."""
-    with bytes_cache_lock:
-        cached = video_bytes_cache.get(video_id)
-    if cached:
-        return cached
-
-    # Pas en cache bytes, essayer de télécharger depuis video_cache (URL info)
+@app.route("/stream/<video_id>")
+def stream_video(video_id):
+    """Proxy la vidéo TikTok pour contourner CORS."""
     with cache_lock:
         info = video_cache.get(video_id)
     if not info:
-        return None
-
-    dl_headers = {k: v for k, v in info["headers"].items()
-                  if k.lower() in ("user-agent", "referer", "cookie", "accept")}
-    try:
-        resp = http_requests.get(info["url"], headers=dl_headers, timeout=30)
-        resp.raise_for_status()
-        ct = resp.headers.get("Content-Type", "video/mp4")
-        entry = {"bytes": resp.content, "content_type": ct}
-        with bytes_cache_lock:
-            video_bytes_cache[video_id] = entry
-        return entry
-    except Exception as e:
-        print(f"  [stream] Erreur téléchargement: {e}")
-        return None
-
-
-@app.route("/stream/<video_id>")
-def stream_video(video_id):
-    """Sert la vidéo depuis le cache avec support des Range requests (HTTP 206)."""
-    cached = _ensure_bytes_cached(video_id)
-    if not cached:
         return "Vidéo non trouvée", 404
 
-    data = cached["bytes"]
-    content_type = cached["content_type"]
-    total = len(data)
+    headers = {}
+    for k, v in info["headers"].items():
+        if k.lower() in ("user-agent", "referer", "cookie", "accept"):
+            headers[k] = v
 
-    # Gérer les Range requests (indispensable pour <video> dans la plupart des navigateurs)
-    range_header = request.headers.get("Range")
-    if range_header:
-        # Parse "bytes=start-end"
-        m = re.match(r"bytes=(\d+)-(\d*)", range_header)
-        if m:
-            start = int(m.group(1))
-            end = int(m.group(2)) if m.group(2) else total - 1
-            end = min(end, total - 1)
-            chunk = data[start:end + 1]
-            return Response(
-                chunk,
-                status=206,
-                content_type=content_type,
-                headers={
-                    "Content-Range": f"bytes {start}-{end}/{total}",
-                    "Accept-Ranges": "bytes",
-                    "Content-Length": str(len(chunk)),
-                    "Cache-Control": "public, max-age=3600",
-                },
-            )
+    try:
+        resp = http_requests.get(info["url"], headers=headers, stream=True, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  [stream] Erreur proxy: {e}")
+        return f"Erreur proxy: {e}", 502
+
+    content_type = resp.headers.get("Content-Type", "video/mp4")
+
+    def generate():
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            yield chunk
 
     return Response(
-        data,
+        generate(),
         content_type=content_type,
         headers={
             "Accept-Ranges": "bytes",
-            "Content-Length": str(total),
             "Cache-Control": "public, max-age=3600",
         },
     )
@@ -211,20 +172,14 @@ def stream_video(video_id):
 
 @app.route("/api/extract")
 def api_extract():
-    """Extrait et pré-télécharge la vidéo pour la servir via /stream/."""
+    """Proxy pour l'API tikwm — utilisé en fallback par le client."""
     url = request.args.get("url", "")
-    video_id = request.args.get("video_id", "")
     if not url:
         return {"error": "URL manquante"}, 400
     info = extract_video_info(url)
-    if not info:
-        return {"error": "Extraction échouée"}, 500
-    # Mettre en cache pour que /stream/ puisse servir
-    if video_id:
-        with cache_lock:
-            video_cache[video_id] = info
-        _ensure_bytes_cached(video_id)
-    return {"video_url": info["url"]}
+    if info:
+        return {"video_url": info["url"]}
+    return {"error": "Extraction échouée"}, 500
 
 
 # --- Socket.IO ---
@@ -394,30 +349,22 @@ def start_round(room_code):
     room["current_video"] = video
     room["current_owner"] = owner["pseudo"]
 
-    # Extraire et télécharger la vidéo côté serveur
-    video_bytes = None
+    # Extraire la vidéo via tikwm côté serveur
+    direct_url = None
     info = extract_video_info(video["url"])
     if info and info["url"]:
+        direct_url = info["url"]
+        # Stocker dans le cache pour le proxy /stream/ (fallback)
         with cache_lock:
             video_cache[video["video_id"]] = info
-        try:
-            dl_headers = {k: v for k, v in info["headers"].items()
-                         if k.lower() in ("user-agent", "referer", "cookie", "accept")}
-            resp = http_requests.get(info["url"], headers=dl_headers, timeout=30)
-            resp.raise_for_status()
-            video_bytes = resp.content
-            with bytes_cache_lock:
-                video_bytes_cache.clear()
-                video_bytes_cache[video["video_id"]] = {"bytes": video_bytes, "content_type": resp.headers.get("Content-Type", "video/mp4")}
-            print(f"  ✓ Vidéo {video['video_id']} téléchargée ({len(video_bytes) // 1024} KB)")
-        except Exception as e:
-            print(f"  ✗ Téléchargement échoué: {e}")
+        print(f"  ✓ URL directe extraite pour {video['video_id']}")
     else:
-        print(f"  ✗ Extraction serveur échouée")
+        print(f"  ✗ Extraction serveur échouée, le client fera l'extraction")
 
     round_data = {
         "round": room["current_round"],
         "total_rounds": room["num_rounds"],
+        "direct_url": direct_url,
         "tiktok_url": video["url"],
         "video_id": video["video_id"],
         "author": video["author"],
@@ -425,20 +372,10 @@ def start_round(room_code):
         "scores": room["scores"],
     }
 
-    # Envoyer les infos du round à chaque joueur
+    # Send to each player — the owner gets a flag
     for sid, p in room["players"].items():
         personal_data = {**round_data, "is_yours": (p["pseudo"] == room["current_owner"])}
         emit("new_round", personal_data, to=sid)
-
-    # Envoyer les bytes vidéo à chaque joueur un par un via SocketIO (base64)
-    if video_bytes:
-        video_b64 = base64.b64encode(video_bytes).decode("ascii")
-        print(f"  Vidéo encodée en base64 ({len(video_b64) // 1024} KB)")
-        for sid in list(room["players"].keys()):
-            pseudo = room["players"].get(sid, {}).get("pseudo", "?")
-            print(f"  → Envoi vidéo à {pseudo}...")
-            socketio.emit("video_data", {"b64": video_b64}, to=sid)
-            print(f"  ✓ Envoyé à {pseudo}")
 
     room["phase"] = "voting"
 
@@ -780,54 +717,81 @@ function renderScoreboard(scores, containerId) {
     ).join('');
 }
 
-// --- Vidéo : réception via SocketIO (base64) + fallback ---
-let videoWrapper = null;
-let currentVideoId = null;
-let videoDataTimeout = null;
+// --- Chargement vidéo : 3 méthodes en cascade ---
+async function loadVideo(directUrl, tiktokUrl, videoId, wrapper) {
+  // Méthode 1 : URL directe envoyée par le serveur
+  if (directUrl) {
+    console.log('[video] Essai URL directe...');
+    if (await tryPlayVideo(directUrl, wrapper)) return;
+  }
 
-function playVideoBlob(blob, wrapper) {
-  const blobUrl = URL.createObjectURL(blob);
-  const video = document.createElement('video');
-  video.controls = true;
-  video.autoplay = true;
-  video.playsInline = true;
-  video.muted = true;
-  video.preload = 'auto';
-  video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
-  video.src = blobUrl;
-  wrapper.innerHTML = '';
-  wrapper.appendChild(video);
-  video.play().then(() => { video.muted = false; }).catch(() => { video.muted = true; video.play().catch(() => {}); });
+  // Méthode 2 : Extraction côté client via tikwm (IP du joueur)
+  console.log('[video] Essai tikwm côté client...');
+  try {
+    const r = await fetch('https://www.tikwm.com/api/', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'url=' + encodeURIComponent(tiktokUrl) + '&hd=1',
+    });
+    const data = await r.json();
+    if (data.code === 0) {
+      let vurl = data.data.play || data.data.hdplay;
+      if (vurl) {
+        if (vurl.startsWith('/')) vurl = 'https://www.tikwm.com' + vurl;
+        console.log('[video] tikwm client OK');
+        if (await tryPlayVideo(vurl, wrapper)) return;
+      }
+    }
+  } catch(e) {
+    console.log('[video] tikwm client CORS/erreur:', e.message);
+  }
+
+  // Méthode 3 : Proxy serveur (API extract + stream)
+  console.log('[video] Essai via proxy serveur...');
+  try {
+    const r = await fetch('/api/extract?url=' + encodeURIComponent(tiktokUrl));
+    const data = await r.json();
+    if (data.video_url) {
+      // Essayer direct d'abord, puis proxy
+      if (await tryPlayVideo(data.video_url, wrapper)) return;
+      if (await tryPlayVideo('/stream/' + videoId, wrapper)) return;
+    }
+  } catch(e) {
+    console.log('[video] proxy erreur:', e.message);
+  }
+
+  wrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vidéo 😕</div>';
 }
 
-socket.on('video_data', function(msg) {
-  if (videoDataTimeout) { clearTimeout(videoDataTimeout); videoDataTimeout = null; }
-  console.log('[video] Re\u00e7u via SocketIO, taille base64:', msg.b64.length);
-  if (!videoWrapper) return;
-  try {
-    const binary = atob(msg.b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], {type: 'video/mp4'});
-    playVideoBlob(blob, videoWrapper);
-  } catch(e) {
-    console.log('[video] Erreur d\u00e9codage:', e.message);
-    fallbackStream();
-  }
-});
+function tryPlayVideo(url, wrapper) {
+  return new Promise(resolve => {
+    const video = document.createElement('video');
+    video.controls = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.style.cssText = 'width:100%;max-height:75vh;background:#000;display:block';
 
-async function fallbackStream() {
-  if (!currentVideoId || !videoWrapper) return;
-  console.log('[video] Fallback /stream/...');
-  videoWrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement alternatif...</div>';
-  try {
-    const resp = await fetch('/stream/' + currentVideoId);
-    if (resp.ok) {
-      const blob = await resp.blob();
-      if (blob.size > 1000 && videoWrapper) { playVideoBlob(blob, videoWrapper); return; }
-    }
-  } catch(e) { console.log('[video] Fallback \u00e9chou\u00e9:', e.message); }
-  if (videoWrapper) videoWrapper.innerHTML = '<div style="padding:30px;color:#fe2c55">Impossible de charger la vid\u00e9o \ud83d\ude15<br><button class="btn btn-small btn-secondary" onclick="fallbackStream()" style="margin-top:10px">\ud83d\udd04 R\u00e9essayer</button></div>';
+    const timeout = setTimeout(() => {
+      console.log('[video] Timeout pour', url.substring(0, 60));
+      resolve(false);
+    }, 15000);
+
+    video.onloadeddata = () => {
+      clearTimeout(timeout);
+      wrapper.innerHTML = '';
+      wrapper.appendChild(video);
+      video.play().catch(() => {});
+      resolve(true);
+    };
+
+    video.onerror = () => {
+      clearTimeout(timeout);
+      console.log('[video] Erreur pour', url.substring(0, 60));
+      resolve(false);
+    };
+
+    video.src = url;
+  });
 }
 
 // --- Socket events ---
@@ -891,14 +855,10 @@ socket.on('new_round', data => {
   const ownerAlert = document.getElementById('ownerAlert');
   ownerAlert.style.display = data.is_yours ? 'block' : 'none';
 
-  // Vidéo : le serveur envoie les bytes via SocketIO (base64)
+  // Video — 3 méthodes en cascade
   const wrapper = document.getElementById('videoWrapper');
-  wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vid\u00e9o...</div>';
-  videoWrapper = wrapper;
-  currentVideoId = data.video_id;
-  // Timeout : si pas re\u00e7u via SocketIO en 25s, fallback HTTP
-  if (videoDataTimeout) clearTimeout(videoDataTimeout);
-  videoDataTimeout = setTimeout(() => { console.log('[video] Timeout SocketIO'); fallbackStream(); }, 25000);
+  wrapper.innerHTML = '<div style="padding:40px;color:#888"><span class="loading-spinner"></span>Chargement de la vidéo...</div>';
+  loadVideo(data.direct_url, data.tiktok_url, data.video_id, wrapper);
 
   // Vote section
   const voteSection = document.getElementById('voteSection');
