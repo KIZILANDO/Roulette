@@ -310,7 +310,7 @@ def on_set_rounds(data):
     if room["host_sid"] != request.sid:
         return
     n = int(data.get("num_rounds", 5))
-    room["num_rounds"] = max(1, min(n, 50))
+    room["num_rounds"] = max(1, min(n, 5000000))
     send_room_update(code)
 
 
