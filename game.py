@@ -625,7 +625,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div id="hostSettings" style="display:none">
     <div class="settings-row">
       <label>Nombre de manches :</label>
-      <input type="number" id="numRoundsInput" value="5" min="1" max="50" onchange="setRounds()">
+      <input type="number" id="numRoundsInput" value="5" min="1" max="5000000" onchange="setRounds()">
     </div>
   </div>
   <div class="file-upload" id="fileUpload">
